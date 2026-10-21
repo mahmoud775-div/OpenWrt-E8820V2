@@ -27,8 +27,8 @@
 # 5. Correct Switch Port Mapping (All 5 Gigabit Ports Bridged for AP Mode):
 #    Orders LAN1, LAN2, LAN3, LAN4, WAN cleanly and bridges them for AP usage.
 # 6. Built-in Quick Setup Web UI (واجهة البرمجة السريعة):
-#    Available at http://192.168.1.1/cgi-bin/quick to change IP, SSID, Password,
-#    and TX Power on a single page.
+#    Available from LuCI > System > "البرمجة السريعة" or at
+#    http://192.168.1.1/cgi-bin/quick to change IP, SSID, Password, and TX Power.
 # ==============================================================================
 
 set -e
@@ -277,6 +277,20 @@ mkdir -p ./files/etc/uci-defaults
 mkdir -p ./files/etc/hotplug.d/ieee80211
 mkdir -p ./files/www/cgi-bin
 mkdir -p ./files/www
+mkdir -p ./files/usr/lib/lua/luci/controller
+
+# 5.3 Add a LuCI menu entry for the existing Quick Setup page
+cat > ./files/usr/lib/lua/luci/controller/quicksetup.lua << 'EOF'
+module("luci.controller.quicksetup", package.seeall)
+
+function index()
+    entry({"admin", "system", "quicksetup"}, call("action_index"), _("البرمجة السريعة"), 90)
+end
+
+function action_index()
+    luci.http.redirect("/cgi-bin/quick")
+end
+EOF
 
 # 5.1 Hotplug script to zero out antenna_gain reduction so full 30 dBm reaches the PA
 cat > ./files/etc/hotplug.d/ieee80211/99-max-txpower << 'EOF'
@@ -461,7 +475,7 @@ exit 0
 EOF
 chmod +x ./files/etc/uci-defaults/99-yemen-ap-custom
 
-# 5.3 Create Quick Setup Web Interface (/www/cgi-bin/quick)
+# 5.4 Create Quick Setup Web Interface (/www/cgi-bin/quick)
 cat > ./files/www/cgi-bin/quick << 'EOF'
 #!/bin/sh
 echo "Content-type: text/html; charset=utf-8"
