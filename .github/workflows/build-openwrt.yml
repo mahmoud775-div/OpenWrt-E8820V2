@@ -1,191 +1,487 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
-name: Build OpenWrt
+name: Build ZTE E8820V2 Yemen AP Firmware
 
 on:
-  repository_dispatch:
+  push:
   workflow_dispatch:
-    inputs:
-      ssh:
-        description: 'SSH connection to Actions'
-        required: false
-        default: 'false'
-
-env:
-  REPO_URL: https://github.com/openwrt/openwrt
-  REPO_BRANCH: openwrt-21.02
-  FEEDS_CONF: feeds.conf.default
-  CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_COWTRANSFER: true
-  UPLOAD_WETRANSFER: false
-  UPLOAD_RELEASE: false
-  TZ: Asia/Shanghai
 
 jobs:
-  build:
+  build_firmware:
     runs-on: ubuntu-22.04
-
     steps:
-    - name: Checkout
-      uses: actions/checkout@main
+      - name: 1. Install OpenWrt Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-distutils rsync unzip zlib1g-dev file wget time
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
-        sudo -E apt-get -qq autoremove --purge
-        sudo -E apt-get -qq clean
-        sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
+      - name: 2. Clone Official OpenWrt 21.02 Source
+        run: |
+          git clone https://github.com/openwrt/openwrt.git -b openwrt-21.02 openwrt
 
-    - name: Clone source code
-      working-directory: /workdir
-      run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+      - name: 3. Inject ZTE E8820V2 Hardware Definition, 30dBm Patch & Auto-MAC Recovery
+        working-directory: ./openwrt
+        run: |
+          cat > ./target/linux/ramips/dts/mt7621_zte_e8820v2.dts << 'EOF'
+          // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+          #include "mt7621.dtsi"
+          #include <dt-bindings/gpio/gpio.h>
+          #include <dt-bindings/input/input.h>
 
-    - name: Load custom feeds
-      run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+          / {
+          	compatible = "zte,e8820v2", "mediatek,mt7621-soc";
+          	model = "ZTE E8820V2";
 
-    - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+          	aliases {
+          		led-boot = &led_sys;
+          		led-failsafe = &led_sys;
+          		led-running = &led_sys;
+          		led-upgrade = &led_sys;
+          		label-mac-device = &gmac0;
+          	};
 
-    - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
+          	chosen {
+          		bootargs = "console=ttyS0,115200 rootfstype=squashfs,jffs2";
+          	};
 
-    - name: Load custom configuration
-      run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
+          	memory@0 {
+          		device_type = "memory";
+          		reg = <0x0 0x4000000>;
+          	};
 
-    - name: SSH connection to Actions
-      uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
-      env:
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          	leds {
+          		compatible = "gpio-leds";
 
-    - name: Download package
-      id: package
-      run: |
-        cd openwrt
-        make defconfig
-        make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
+          		led_sys: sys {
+          			label = "white:sys";
+          			gpios = <&gpio 29 GPIO_ACTIVE_LOW>;
+          		};
 
-    - name: Compile the firmware
-      id: compile
-      run: |
-        cd openwrt
-        echo -e "$(nproc) thread compile"
-        # make -j$(nproc) || make -j1 || make -j1 V=s
-        make -j1
-        echo "::set-output name=status::success"
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+          		led_power: power {
+          			label = "white:power";
+          			gpios = <&gpio 31 GPIO_ACTIVE_LOW>;
+          		};
+          	};
 
-    - name: Check space usage
-      if: (!cancelled())
-      run: df -hT
+          	keys {
+          		compatible = "gpio-keys";
 
-    - name: Upload bin directory
-      uses: actions/upload-artifact@main
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      with:
-        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: openwrt/bin
+          		reset {
+          			label = "reset";
+          			gpios = <&gpio 18 GPIO_ACTIVE_LOW>;
+          			linux,code = <KEY_RESTART>;
+          		};
 
-    - name: Organize files
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "::set-output name=status::success"
+          		wps {
+          			label = "wps";
+          			gpios = <&gpio 24 GPIO_ACTIVE_LOW>;
+          			linux,code = <KEY_WPS_BUTTON>;
+          		};
+          	};
+          };
 
-    - name: Upload firmware directory
-      uses: actions/upload-artifact@main
-      if: steps.organize.outputs.status == 'success' && !cancelled()
-      with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+          &spi0 {
+          	status = "okay";
 
-    - name: Upload firmware to cowtransfer
-      id: cowtransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
-        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
-        echo "::set-output name=url::$(cat cowtransfer.log | grep https | cut -f3 -d" ")"
+          	flash@0 {
+          		compatible = "jedec,spi-nor";
+          		reg = <0>;
+          		spi-max-frequency = <25000000>;
+          		broken-flash-reset;
 
-    - name: Upload firmware to WeTransfer
-      id: wetransfer
-      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
-      run: |
-        curl -fsSL git.io/file-transfer | sh
-        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
-        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
-        echo "::set-output name=url::$(cat wetransfer.log | grep https | cut -f3 -d" ")"
+          		partitions {
+          			compatible = "fixed-partitions";
+          			#address-cells = <1>;
+          			#size-cells = <1>;
 
-    - name: Generate release tag
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "::set-output name=release_tag::$(date +"%Y.%m.%d-%H%M")"
-        touch release.txt
-        [ $UPLOAD_COWTRANSFER = true ] && echo "🔗 [Cowtransfer](${{ steps.cowtransfer.outputs.url }})" >> release.txt
-        [ $UPLOAD_WETRANSFER = true ] && echo "🔗 [WeTransfer](${{ steps.wetransfer.outputs.url }})" >> release.txt
-        echo "::set-output name=status::success"
+          			partition@0 {
+          				label = "u-boot";
+          				reg = <0x0 0x30000>;
+          			};
 
-    - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+          			partition@30000 {
+          				label = "u-boot-env";
+          				reg = <0x30000 0x10000>;
+          			};
 
-    - name: Delete workflow runs
-      uses: GitRML/delete-workflow-runs@main
-      with:
-        retain_days: 1
-        keep_minimum_runs: 3
+          			factory: partition@40000 {
+          				label = "factory";
+          				reg = <0x40000 0x10000>;
+          			};
 
-    - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.1.0
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          			partition@50000 {
+          				compatible = "denx,uimage";
+          				label = "firmware";
+          				reg = <0x50000 0xfb0000>;
+          			};
+          		};
+          	};
+          };
+
+          &pcie {
+          	status = "okay";
+          };
+
+          &pcie0 {
+          	mt76@0,0 {
+          		reg = <0x0000 0 0 0 0>;
+          		mediatek,mtd-eeprom = <&factory 0x0000>;
+          		ieee80211-freq-limit = <2400000 2500000>;
+          		led {
+          			led-active-low;
+          		};
+          	};
+          };
+
+          &pcie1 {
+          	mt76@0,0 {
+          		reg = <0x0000 0 0 0 0>;
+          		mediatek,mtd-eeprom = <&factory 0x8000>;
+          		ieee80211-freq-limit = <5000000 6000000>;
+          		led {
+          			led-sources = <2>;
+          			led-active-low;
+          		};
+          	};
+          };
+
+          &gmac0 {
+          	mtd-mac-address = <&factory 0xe000>;
+          };
+
+          &switch0 {
+          	ports {
+          		port@0 {
+          			status = "okay";
+          			label = "lan1";
+          		};
+
+          		port@1 {
+          			status = "okay";
+          			label = "lan2";
+          		};
+
+          		port@2 {
+          			status = "okay";
+          			label = "lan3";
+          		};
+
+          		port@3 {
+          			status = "okay";
+          			label = "lan4";
+          		};
+
+          		port@4 {
+          			status = "okay";
+          			label = "wan";
+          			mtd-mac-address = <&factory 0xe006>;
+          		};
+          	};
+          };
+
+          &state_default {
+          	gpio {
+          		groups = "i2c", "uart2", "uart3", "wdt";
+          		function = "gpio";
+          	};
+          };
+          EOF
+
+          cat >> ./target/linux/ramips/image/mt7621.mk << 'EOF'
+
+          define Device/zte_e8820v2
+            $(Device/dsa-migration)
+            $(Device/uimage-lzma-loader)
+            IMAGE_SIZE := 16064k
+            DEVICE_VENDOR := ZTE
+            DEVICE_MODEL := E8820V2
+            SUPPORTED_DEVICES += zte,e8820v2 e8820v2 zte,e8822
+            DEVICE_PACKAGES := kmod-mt7603 kmod-mt76x2 kmod-usb3 kmod-usb-ledtrig-usbport wpad-basic-wolfssl iw iwinfo luci
+          endef
+          TARGET_DEVICES += zte_e8820v2
+          EOF
+
+          sed -i 's/^esac/zte,e8820v2)\n\tucidef_set_led_netdev "sys" "SYS_LED" "white:sys" "eth0" "tx rx"\n\tucidef_set_led_timer "power" "POWER_LED" "white:power" "100" "8000"\n\t;;\nesac/g' ./target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
+
+          mkdir -p ./package/firmware/wireless-regdb/patches
+          cat > ./package/firmware/wireless-regdb/patches/999-unlock-max-txpower-yemen.patch << 'EOF'
+          --- a/db.txt
+          +++ b/db.txt
+          @@ -1,8 +1,8 @@
+           country 00:
+          -	(2402 - 2472 @ 40), (20)
+          -	(2457 - 2482 @ 20), (20), AUTO-BW, PASSIVE-SCAN
+          -	(2474 - 2494 @ 20), (20), NO-OFDM, PASSIVE-SCAN
+          -	(5170 - 5250 @ 80), (20), AUTO-BW, PASSIVE-SCAN
+          -	(5250 - 5330 @ 80), (20), DFS, AUTO-BW, PASSIVE-SCAN
+          -	(5490 - 5730 @ 160), (20), DFS, PASSIVE-SCAN
+          -	(5735 - 5835 @ 80), (20), PASSIVE-SCAN
+          +	(2402 - 2482 @ 40), (30)
+          +	(5170 - 5250 @ 80), (30), AUTO-BW
+          +	(5250 - 5330 @ 80), (30), AUTO-BW
+          +	(5490 - 5730 @ 160), (30), AUTO-BW
+          +	(5735 - 5835 @ 80), (30), AUTO-BW
+          EOF
+
+          mkdir -p ./files/etc/uci-defaults
+          mkdir -p ./files/etc/hotplug.d/ieee80211
+          mkdir -p ./files/www/cgi-bin
+
+          cat > ./files/etc/hotplug.d/ieee80211/99-max-txpower << 'EOF'
+          #!/bin/sh
+          [ "$ACTION" = "add" ] || exit 0
+          if command -v iw >/dev/null 2>&1; then
+              iw phy "${DEVICENAME}" set antenna_gain 0 2>/dev/null || true
+          fi
+          EOF
+          chmod +x ./files/etc/hotplug.d/ieee80211/99-max-txpower
+
+          cat > ./files/etc/uci-defaults/99-yemen-ap-custom << 'EOF'
+          #!/bin/sh
+          uci set system.@system[0].hostname='ZTE-E8820V2'
+          uci set system.@system[0].zonename='Asia/Aden'
+          uci set system.@system[0].timezone='<+03>-3'
+          uci set luci.main.lang='en'
+          uci commit system
+          uci commit luci
+
+          read_mac_hex() {
+              dd if="$1" bs=1 skip=$(($2)) count=6 2>/dev/null | hexdump -v -e '1/1 "%02x:"' | sed 's/:$//'
+          }
+
+          is_valid_mac() {
+              local mac="$1"
+              [ -z "$mac" ] && return 1
+              [ "$mac" = "ff:ff:ff:ff:ff:ff" ] && return 1
+              [ "$mac" = "00:00:00:00:00:00" ] && return 1
+              local first_byte="0x$(echo "$mac" | cut -d: -f1)"
+              [ $((first_byte & 1)) -eq 0 ] || return 1
+              return 0
+          }
+
+          increment_mac() {
+              local prefix=$(echo "$1" | cut -d: -f1-5)
+              local last="0x$(echo "$1" | cut -d: -f6)"
+              local next=$(( (last + $2) & 0xff ))
+              printf "%s:%02x" "$prefix" "$next"
+          }
+
+          ORIG_MAC_2G=$(read_mac_hex /dev/mtd0 131092)
+          ORIG_MAC_5G=$(read_mac_hex /dev/mtd0 131108)
+          FAC_MAC_E000=$(read_mac_hex /dev/mtd2 57344)
+          FAC_MAC_0004=$(read_mac_hex /dev/mtd2 4)
+
+          if is_valid_mac "$ORIG_MAC_2G"; then
+              if ! is_valid_mac "$ORIG_MAC_5G" || [ "$ORIG_MAC_5G" = "$ORIG_MAC_2G" ]; then
+                  ORIG_MAC_5G=$(increment_mac "$ORIG_MAC_2G" 1)
+              fi
+
+              if [ "$FAC_MAC_E000" != "$ORIG_MAC_2G" ] || [ "$FAC_MAC_0004" != "$ORIG_MAC_2G" ]; then
+                  dd if=/dev/mtd2 of=/tmp/factory.bin bs=65536 count=1 2>/dev/null
+                  SIG_2G=$(dd if=/dev/mtd0 bs=1 skip=192512 count=2 2>/dev/null | hexdump -v -e '1/1 "%02x"')
+                  if [ "$SIG_2G" = "0376" ]; then
+                      dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=192512 seek=0 count=304 conv=notrunc 2>/dev/null
+                  fi
+                  SIG_5G=$(dd if=/dev/mtd0 bs=1 skip=194560 count=2 2>/dev/null | hexdump -v -e '1/1 "%02x"')
+                  if [ "$SIG_5G" = "6276" ]; then
+                      dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=194560 seek=32768 count=496 conv=notrunc 2>/dev/null
+                  fi
+                  printf '\xc0\x81\x82\xc3\x04\x45\x46\x07\x08\x09' | dd of=/tmp/factory.bin bs=1 seek=33248 count=10 conv=notrunc 2>/dev/null
+                  dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131092 seek=4 count=6 conv=notrunc 2>/dev/null
+                  dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131092 seek=57344 count=6 conv=notrunc 2>/dev/null
+                  dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131108 seek=32772 count=6 conv=notrunc 2>/dev/null
+                  dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131108 seek=57350 count=6 conv=notrunc 2>/dev/null
+                  mtd write /tmp/factory.bin factory 2>/dev/null || true
+                  rm -f /tmp/factory.bin
+              fi
+
+              uci set network.lan.macaddr="$ORIG_MAC_2G"
+              uci set network.wan.macaddr="$ORIG_MAC_5G"
+              uci set wireless.radio0.macaddr="$ORIG_MAC_2G"
+              uci set wireless.radio1.macaddr="$ORIG_MAC_5G"
+          fi
+
+          uci delete network.globals.ula_prefix 2>/dev/null || true
+          if uci -q get network.@device[0].ports >/dev/null; then
+              uci set network.@device[0].ports='lan1 lan2 lan3 lan4 wan'
+          fi
+          uci delete network.wan 2>/dev/null || true
+          uci delete network.wan6 2>/dev/null || true
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.1.1'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.ipv6='0'
+
+          uci set dhcp.lan.ignore='1'
+          uci delete dhcp.lan.ra 2>/dev/null || true
+          uci delete dhcp.lan.dhcpv6 2>/dev/null || true
+          uci delete dhcp.lan.ndp 2>/dev/null || true
+          uci set dhcp.wan.ignore='1'
+          uci commit network
+          uci commit dhcp
+
+          for svc in odhcpd firewall dnsmasq log; do
+              if [ -x "/etc/init.d/$svc" ]; then
+                  /etc/init.d/$svc stop 2>/dev/null || true
+                  /etc/init.d/$svc disable 2>/dev/null || true
+              fi
+          done
+
+          DEFAULT_SSID_SUFFIX=$(echo "$ORIG_MAC_2G" | awk -F: '{print toupper($5$6)}')
+          [ -z "$DEFAULT_SSID_SUFFIX" ] && DEFAULT_SSID_SUFFIX="AP"
+
+          uci set wireless.radio0.disabled='0'
+          uci set wireless.radio0.country='00'
+          uci set wireless.radio0.channel='auto'
+          uci set wireless.radio0.htmode='HT40'
+          uci set wireless.radio0.noscan='1'
+          uci set wireless.radio0.txpower='30'
+          uci set wireless.default_radio0.disabled='0'
+          uci set wireless.default_radio0.network='lan'
+          uci set wireless.default_radio0.mode='ap'
+          uci set wireless.default_radio0.ssid="ZTE_${DEFAULT_SSID_SUFFIX}"
+          uci set wireless.default_radio0.encryption='none'
+
+          uci set wireless.radio1.disabled='0'
+          uci set wireless.radio1.country='00'
+          uci set wireless.radio1.channel='auto'
+          uci set wireless.radio1.htmode='VHT80'
+          uci set wireless.radio1.txpower='30'
+          uci set wireless.default_radio1.disabled='0'
+          uci set wireless.default_radio1.network='lan'
+          uci set wireless.default_radio1.mode='ap'
+          uci set wireless.default_radio1.ssid="ZTE_${DEFAULT_SSID_SUFFIX}_5G"
+          uci set wireless.default_radio1.encryption='none'
+          uci commit wireless
+          exit 0
+          EOF
+          chmod +x ./files/etc/uci-defaults/99-yemen-ap-custom
+
+          cat > ./files/www/cgi-bin/quick << 'EOF'
+          #!/bin/sh
+          echo "Content-type: text/html; charset=utf-8"
+          echo ""
+          urldecode() {
+              echo -e "$(echo "$1" | sed 's/+/ /g;s/%\([0-9A-Fa-f][0-9A-Fa-f]\)/\\x\1/g')"
+          }
+          MSG=""
+          if [ "$REQUEST_METHOD" = "POST" ]; then
+              read -r POST_DATA
+              NEW_IP=$(urldecode "$(echo "$POST_DATA" | sed -n 's/.*ipaddr=\([^&]*\).*/\1/p')")
+              NEW_SSID2=$(urldecode "$(echo "$POST_DATA" | sed -n 's/.*ssid2=\([^&]*\).*/\1/p')")
+              NEW_SSID5=$(urldecode "$(echo "$POST_DATA" | sed -n 's/.*ssid5=\([^&]*\).*/\1/p')")
+              NEW_KEY=$(urldecode "$(echo "$POST_DATA" | sed -n 's/.*wpakey=\([^&]*\).*/\1/p')")
+              NEW_TX=$(urldecode "$(echo "$POST_DATA" | sed -n 's/.*txpower=\([^&]*\).*/\1/p')")
+              [ -n "$NEW_IP" ] && uci set network.lan.ipaddr="$NEW_IP"
+              [ -n "$NEW_SSID2" ] && uci set wireless.default_radio0.ssid="$NEW_SSID2"
+              [ -n "$NEW_SSID5" ] && uci set wireless.default_radio1.ssid="$NEW_SSID5"
+              if [ -n "$NEW_TX" ]; then
+                  uci set wireless.radio0.txpower="$NEW_TX"
+                  uci set wireless.radio1.txpower="$NEW_TX"
+              fi
+              if [ -n "$NEW_KEY" ]; then
+                  uci set wireless.default_radio0.encryption='psk2'
+                  uci set wireless.default_radio0.key="$NEW_KEY"
+                  uci set wireless.default_radio1.encryption='psk2'
+                  uci set wireless.default_radio1.key="$NEW_KEY"
+              else
+                  uci set wireless.default_radio0.encryption='none'
+                  uci delete wireless.default_radio0.key 2>/dev/null || true
+                  uci set wireless.default_radio1.encryption='none'
+                  uci delete wireless.default_radio1.key 2>/dev/null || true
+              fi
+              uci commit network
+              uci commit wireless
+              (sleep 1; /etc/init.d/network reload; wifi reload) >/dev/null 2>&1 &
+              MSG="<div style='background:#d1fae5;color:#065f46;padding:12px;border-radius:6px;margin-bottom:16px;'><b>Saved!</b> Settings applied.</div>"
+          fi
+          CUR_IP=$(uci -q get network.lan.ipaddr)
+          CUR_MAC=$(uci -q get network.lan.macaddr || cat /sys/class/net/br-lan/address 2>/dev/null)
+          CUR_SSID2=$(uci -q get wireless.default_radio0.ssid)
+          CUR_SSID5=$(uci -q get wireless.default_radio1.ssid)
+          CUR_KEY=$(uci -q get wireless.default_radio0.key)
+          CUR_TX=$(uci -q get wireless.radio0.txpower || echo "30")
+          cat << HTML
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>ZTE E8820V2 - Quick AP Setup</title>
+          <style>
+            body { font-family: sans-serif; background: #f3f4f6; margin: 0; padding: 20px; color: #1f2937; }
+            .card { max-width: 480px; margin: 20px auto; background: #fff; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); padding: 24px; }
+            h2 { margin-top: 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; }
+            .meta { background: #f9fafb; padding: 10px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; border: 1px solid #e5e7eb; }
+            label { display: block; font-weight: 600; margin: 12px 0 4px; font-size: 14px; }
+            input, select { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; box-sizing: border-box; }
+            button { width: 100%; margin-top: 20px; padding: 12px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
+            .links { margin-top: 16px; text-align: center; font-size: 13px; }
+          </style>
+          </head>
+          <body>
+          <div class="card">
+            <h2>ZTE E8820V2 Quick Setup</h2>
+            $MSG
+            <div class="meta"><b>Original Sticker MAC:</b> ${CUR_MAC} | <b>Mode:</b> Bridge AP (DHCP Off)</div>
+            <form method="POST" action="/cgi-bin/quick">
+              <label>Router LAN IP Address</label>
+              <input type="text" name="ipaddr" value="${CUR_IP}" required>
+              <label>2.4GHz Wi-Fi Name (SSID)</label>
+              <input type="text" name="ssid2" value="${CUR_SSID2}" required>
+              <label>5GHz Wi-Fi Name (SSID)</label>
+              <input type="text" name="ssid5" value="${CUR_SSID5}" required>
+              <label>Wi-Fi Password (leave empty for Open Hotspot)</label>
+              <input type="text" name="wpakey" value="${CUR_KEY}" placeholder="Open Network (No Password)">
+              <label>Wi-Fi TX Power (dBm)</label>
+              <select name="txpower">
+                <option value="30" $( [ "$CUR_TX" = "30" ] && echo "selected" )>30 dBm (1000 mW - Maximum)</option>
+                <option value="27" $( [ "$CUR_TX" = "27" ] && echo "selected" )>27 dBm (500 mW - High)</option>
+                <option value="23" $( [ "$CUR_TX" = "23" ] && echo "selected" )>23 dBm (200 mW - Medium)</option>
+              </select>
+              <button type="submit">Save & Apply Settings</button>
+            </form>
+            <div class="links"><a href="/cgi-bin/luci">Full OpenWrt LuCI Settings &rarr;</a></div>
+          </div>
+          </body>
+          </html>
+          HTML
+          EOF
+          chmod +x ./files/www/cgi-bin/quick
+
+      - name: 4. Update Feeds & Configure Build
+        working-directory: ./openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cat > ./.config << 'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820v2=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-compat=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_kmod-mt7603=y
+          CONFIG_PACKAGE_kmod-mt76x2=y
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-ledtrig-usbport=y
+          CONFIG_PACKAGE_wpad-basic-wolfssl=y
+          CONFIG_PACKAGE_iw=y
+          CONFIG_PACKAGE_iwinfo=y
+          # CONFIG_PACKAGE_odhcpd-ipv6only is not set
+          # CONFIG_PACKAGE_odhcpd is not set
+          EOF
+          make defconfig
+
+      - name: 5. Download Packages & Compile Firmware
+        working-directory: ./openwrt
+        run: |
+          make download -j8
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 6. Upload Ready-to-Flash Firmware (.bin)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZTE-E8820V2-Yemen-AP-Firmware
+          path: openwrt/bin/targets/ramips/mt7621/*sysupgrade.bin
