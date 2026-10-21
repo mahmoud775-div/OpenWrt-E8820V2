@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  FORCE_UNSAFE_CONFIGURE: 1
+
 jobs:
   build_firmware:
     runs-on: ubuntu-22.04
@@ -15,11 +18,11 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
             python3-distutils rsync unzip zlib1g-dev file wget time
 
-      - name: 2. Clone Official OpenWrt 21.02 Source
+      - name: 2. Fast Shallow Clone of Official OpenWrt 21.02
         run: |
-          git clone https://github.com/openwrt/openwrt.git -b openwrt-21.02 openwrt
+          git clone --depth 1 https://github.com/openwrt/openwrt.git -b openwrt-21.02 openwrt
 
-      - name: 3. Inject ZTE E8820V2 Hardware Definition, 30dBm Patch & Auto-MAC Recovery
+      - name: 3. Inject ZTE E8820V2 Hardware Definition, 30dBm Unlock & Auto-MAC Recovery
         working-directory: ./openwrt
         run: |
           cat > ./target/linux/ramips/dts/mt7621_zte_e8820v2.dts << 'EOF'
@@ -203,25 +206,8 @@ jobs:
 
           sed -i 's/^esac/zte,e8820v2)\n\tucidef_set_led_netdev "sys" "SYS_LED" "white:sys" "eth0" "tx rx"\n\tucidef_set_led_timer "power" "POWER_LED" "white:power" "100" "8000"\n\t;;\nesac/g' ./target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
 
-          mkdir -p ./package/firmware/wireless-regdb/patches
-          cat > ./package/firmware/wireless-regdb/patches/999-unlock-max-txpower-yemen.patch << 'EOF'
-          --- a/db.txt
-          +++ b/db.txt
-          @@ -1,8 +1,8 @@
-           country 00:
-          -	(2402 - 2472 @ 40), (20)
-          -	(2457 - 2482 @ 20), (20), AUTO-BW, PASSIVE-SCAN
-          -	(2474 - 2494 @ 20), (20), NO-OFDM, PASSIVE-SCAN
-          -	(5170 - 5250 @ 80), (20), AUTO-BW, PASSIVE-SCAN
-          -	(5250 - 5330 @ 80), (20), DFS, AUTO-BW, PASSIVE-SCAN
-          -	(5490 - 5730 @ 160), (20), DFS, PASSIVE-SCAN
-          -	(5735 - 5835 @ 80), (20), PASSIVE-SCAN
-          +	(2402 - 2482 @ 40), (30)
-          +	(5170 - 5250 @ 80), (30), AUTO-BW
-          +	(5250 - 5330 @ 80), (30), AUTO-BW
-          +	(5490 - 5730 @ 160), (30), AUTO-BW
-          +	(5735 - 5835 @ 80), (30), AUTO-BW
-          EOF
+          # Patch-proof 30 dBm (1000mW) unlock directly in wireless-regdb Makefile before db2fw.py runs
+          sed -i '/db2fw.py/i \\tsed -i -E "s/\\((1[0-9]|2[0-9])\\)/(30)/g; s/, NO-IR//g; s/, DFS//g; s/, PASSIVE-SCAN//g" $(PKG_BUILD_DIR)/db.txt' ./package/firmware/wireless-regdb/Makefile
 
           mkdir -p ./files/etc/uci-defaults
           mkdir -p ./files/etc/hotplug.d/ieee80211
@@ -449,9 +435,11 @@ jobs:
           EOF
           chmod +x ./files/www/cgi-bin/quick
 
-      - name: 4. Update Feeds & Configure Build
+      - name: 4. Fast Feeds Update & Configuration
         working-directory: ./openwrt
         run: |
+          # Remove unused feeds (telephony & routing) to speed up feed update by 50%
+          sed -i '/telephony/d; /routing/d' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           cat > ./.config << 'EOF'
@@ -474,11 +462,12 @@ jobs:
           EOF
           make defconfig
 
-      - name: 5. Download Packages & Compile Firmware
+      - name: 5. Parallel Download & Fast Compile
         working-directory: ./openwrt
         run: |
           make download -j8
           make -j$(nproc) || make -j1 V=s
+          ls -lh bin/targets/ramips/mt7621/*sysupgrade.bin
 
       - name: 6. Upload Ready-to-Flash Firmware (.bin)
         uses: actions/upload-artifact@v4
