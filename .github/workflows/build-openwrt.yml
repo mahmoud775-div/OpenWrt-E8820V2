@@ -1,4 +1,4 @@
-name: Build ZTE E8820V2 Yemen AP Firmware
+name: Build ZTE E8820V2 Yemen AP Firmware (v3)
 
 on:
   push:
@@ -18,11 +18,11 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
             python3-distutils rsync unzip zlib1g-dev file wget time
 
-      - name: 2. Fast Shallow Clone of Official OpenWrt 21.02
+      - name: 2. Fast Shallow Clone of Official OpenWrt 21.02 (Latest 21.02.7 Stable)
         run: |
           git clone --depth 1 https://github.com/openwrt/openwrt.git -b openwrt-21.02 openwrt
 
-      - name: 3. Inject ZTE E8820V2 Hardware Definition, 30dBm Unlock & Auto-MAC Recovery
+      - name: 3. Inject ZTE E8820V2 Hardware, 30dBm RegDB Unlock, LLDP, Watchcat & Auto-MAC
         working-directory: ./openwrt
         run: |
           cat > ./target/linux/ramips/dts/mt7621_zte_e8820v2.dts << 'EOF'
@@ -199,16 +199,54 @@ jobs:
             DEVICE_VENDOR := ZTE
             DEVICE_MODEL := E8820V2
             SUPPORTED_DEVICES += zte,e8820v2 e8820v2 zte,e8822
-            DEVICE_PACKAGES := kmod-mt7603 kmod-mt76x2 kmod-usb3 kmod-usb-ledtrig-usbport wpad-basic-wolfssl iw iwinfo luci
+            DEVICE_PACKAGES := kmod-mt7603 kmod-mt76x2 kmod-usb3 kmod-usb-ledtrig-usbport wpad-basic-wolfssl iw iwinfo lldpd watchcat luci luci-theme-bootstrap luci-app-lldpd luci-app-watchcat odhcpd-ipv6only
           endef
           TARGET_DEVICES += zte_e8820v2
           EOF
 
           sed -i 's/^esac/zte,e8820v2)\n\tucidef_set_led_netdev "sys" "SYS_LED" "white:sys" "eth0" "tx rx"\n\tucidef_set_led_timer "power" "POWER_LED" "white:power" "100" "8000"\n\t;;\nesac/g' ./target/linux/ramips/mt7621/base-files/etc/board.d/01_leds
 
-          # Patch-proof 30 dBm (1000mW) unlock directly in wireless-regdb Makefile before db2fw.py runs
-          sed -i '/db2fw.py/i \\tsed -i -E "s/\\((1[0-9]|2[0-9])\\)/(30)/g; s/, NO-IR//g; s/, DFS//g; s/, PASSIVE-SCAN//g" $(PKG_BUILD_DIR)/db.txt' ./package/firmware/wireless-regdb/Makefile
+          # 3.1 Enable Wi-Fi by default directly in mac80211.sh (fixes disabled=1 on first boot)
+          sed -i 's/disabled=1/disabled=0/g; s/option disabled 1/option disabled 0/g' ./package/kernel/mac80211/files/lib/wifi/mac80211.sh
 
+          # 3.2 Create Python script to unlock 30 dBm (1000mW), max bandwidth (HT40/VHT80), and all frequencies in wireless-regdb
+          cat > /tmp/unlock_regdb.py << 'EOF'
+          import sys, re
+
+          db_path = sys.argv[1]
+          with open(db_path, 'r', encoding='utf-8') as f:
+              text = f.read()
+
+          # Convert all power limits (whether in dBm like (20) or in mW like (100 mW)) to (30) dBm
+          text = re.sub(r',\s*\([0-9]+(\.[0-9]+)?(\s*mW|\s*dBm)?\)', ', (30)', text)
+          # Remove restrictive flags
+          for flag in [', NO-IR', ', PASSIVE-SCAN', ', DFS', ', NO-OUTDOOR', ', NO-OFDM']:
+              text = text.replace(flag, '')
+          # Upgrade 2.4GHz @ 20 bandwidth caps to @ 40
+          text = re.sub(r'(\(24[0-9]{2}\s*-\s*24[0-9]{2}(\.[0-9]+)?\s*@\s*)20\)', r'\g<1>40)', text)
+
+          # Replace PA, US, YE, BZ, BO, and 00 with wide-open full-spectrum 30 dBm rules
+          wide_open_rules = """country {code}: {dfs}
+          \t(2400 - 2483.5 @ 40), (30)
+          \t(5150 - 5350 @ 160), (30), AUTO-BW
+          \t(5470 - 5895 @ 160), (30), AUTO-BW
+          """
+          for code, dfs in [('00', ''), ('PA', 'DFS-FCC'), ('US', 'DFS-FCC'), ('BZ', 'DFS-FCC'), ('BO', 'DFS-FCC'), ('YE', 'DFS-ETSI')]:
+              pattern = rf'^country\s+{code}:.*?(?=^country\s+|\Z)'
+              replacement = wide_open_rules.format(code=code, dfs=dfs).strip() + '\n\n'
+              if re.search(pattern, text, flags=re.MULTILINE | re.DOTALL):
+                  text = re.sub(pattern, replacement, text, flags=re.MULTILINE | re.DOTALL)
+              else:
+                  text += '\n' + replacement
+
+          with open(db_path, 'w', encoding='utf-8') as f:
+              f.write(text)
+          print("Successfully unlocked 30 dBm and full frequency spectrum in db.txt")
+          EOF
+
+          sed -i '/^define Build\/Compile/a \\tpython3 /tmp/unlock_regdb.py $(PKG_BUILD_DIR)/db.txt' ./package/firmware/wireless-regdb/Makefile
+
+          # 3.3 Create Embedded Files: Auto-MAC/EEPROM Sync, LLDP, Watchcat, Service Disabler & Quick Setup UI
           mkdir -p ./files/etc/uci-defaults
           mkdir -p ./files/etc/hotplug.d/ieee80211
           mkdir -p ./files/www/cgi-bin
@@ -217,20 +255,29 @@ jobs:
           #!/bin/sh
           [ "$ACTION" = "add" ] || exit 0
           if command -v iw >/dev/null 2>&1; then
+              iw reg set PA 2>/dev/null || true
               iw phy "${DEVICENAME}" set antenna_gain 0 2>/dev/null || true
+              iw phy "${DEVICENAME}" set txpower fixed 3000 2>/dev/null || true
           fi
           EOF
           chmod +x ./files/etc/hotplug.d/ieee80211/99-max-txpower
 
           cat > ./files/etc/uci-defaults/99-yemen-ap-custom << 'EOF'
           #!/bin/sh
-          uci set system.@system[0].hostname='ZTE-E8820V2'
+
+          # ------------------------------------------------------------------------------
+          # 1. Force English Language, Bootstrap Theme & Yemen Timezone (AST-3)
+          # ------------------------------------------------------------------------------
           uci set system.@system[0].zonename='Asia/Aden'
           uci set system.@system[0].timezone='<+03>-3'
           uci set luci.main.lang='en'
+          uci set luci.main.mediaurlbase='/luci-static/bootstrap'
           uci commit system
           uci commit luci
 
+          # ------------------------------------------------------------------------------
+          # 2. Automatic Original Sticker MAC & Factory EEPROM High-Power Sync
+          # ------------------------------------------------------------------------------
           read_mac_hex() {
               dd if="$1" bs=1 skip=$(($2)) count=6 2>/dev/null | hexdump -v -e '1/1 "%02x:"' | sed 's/:$//'
           }
@@ -272,9 +319,12 @@ jobs:
                   if [ "$SIG_5G" = "6276" ]; then
                       dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=194560 seek=32768 count=496 conv=notrunc 2>/dev/null
                   fi
+                  # Write high-power 5GHz external PA calibration bytes at 0x81E0 (33248)
                   printf '\xc0\x81\x82\xc3\x04\x45\x46\x07\x08\x09' | dd of=/tmp/factory.bin bs=1 seek=33248 count=10 conv=notrunc 2>/dev/null
+                  # Write original 2.4G/LAN MAC (0x20014) to factory 0x0004 (4) and 0xE000 (57344)
                   dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131092 seek=4 count=6 conv=notrunc 2>/dev/null
                   dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131092 seek=57344 count=6 conv=notrunc 2>/dev/null
+                  # Write original 5G MAC (0x20024) to factory 0x8004 (32772) and 0xE006 (57350)
                   dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131108 seek=32772 count=6 conv=notrunc 2>/dev/null
                   dd if=/dev/mtd0 of=/tmp/factory.bin bs=1 skip=131108 seek=57350 count=6 conv=notrunc 2>/dev/null
                   mtd write /tmp/factory.bin factory 2>/dev/null || true
@@ -283,16 +333,20 @@ jobs:
 
               uci set network.lan.macaddr="$ORIG_MAC_2G"
               uci set network.wan.macaddr="$ORIG_MAC_5G"
-              uci set wireless.radio0.macaddr="$ORIG_MAC_2G"
-              uci set wireless.radio1.macaddr="$ORIG_MAC_5G"
           fi
 
+          DEFAULT_SSID_SUFFIX=$(echo "$ORIG_MAC_2G" | awk -F: '{print toupper($5$6)}')
+          [ -z "$DEFAULT_SSID_SUFFIX" ] && DEFAULT_SSID_SUFFIX="AP"
+          uci set system.@system[0].hostname="ZTE-E8820V2-${DEFAULT_SSID_SUFFIX}"
+          uci commit system
+
+          # ------------------------------------------------------------------------------
+          # 3. Keep WAN Separate from LAN Bridge & Disable DHCP Server (IPv4 & IPv6)
+          # ------------------------------------------------------------------------------
           uci delete network.globals.ula_prefix 2>/dev/null || true
           if uci -q get network.@device[0].ports >/dev/null; then
-              uci set network.@device[0].ports='lan1 lan2 lan3 lan4 wan'
+              uci set network.@device[0].ports='lan1 lan2 lan3 lan4'
           fi
-          uci delete network.wan 2>/dev/null || true
-          uci delete network.wan6 2>/dev/null || true
           uci set network.lan.proto='static'
           uci set network.lan.ipaddr='192.168.1.1'
           uci set network.lan.netmask='255.255.255.0'
@@ -306,6 +360,9 @@ jobs:
           uci commit network
           uci commit dhcp
 
+          # ------------------------------------------------------------------------------
+          # 4. Keep odhcpd/dnsmasq/firewall Installed but Disabled at Startup
+          # ------------------------------------------------------------------------------
           for svc in odhcpd firewall dnsmasq log; do
               if [ -x "/etc/init.d/$svc" ]; then
                   /etc/init.d/$svc stop 2>/dev/null || true
@@ -313,32 +370,71 @@ jobs:
               fi
           done
 
-          DEFAULT_SSID_SUFFIX=$(echo "$ORIG_MAC_2G" | awk -F: '{print toupper($5$6)}')
-          [ -z "$DEFAULT_SSID_SUFFIX" ] && DEFAULT_SSID_SUFFIX="AP"
+          # ------------------------------------------------------------------------------
+          # 5. Configure LLDP + CDP (lldpd) so Router Appears in MikroTik Neighbors
+          # ------------------------------------------------------------------------------
+          cat > /etc/config/lldpd << LLDP_EOF
+          config lldpd 'config'
+          	option enable_cdp '1'
+          	option enable_fdp '1'
+          	option enable_sonmp '1'
+          	option enable_edp '1'
+          	option lldp_class '4'
+          	option lldp_description 'ZTE E8820V2 AP (${ORIG_MAC_2G})'
+          	list interface 'loopback'
+          	list interface 'br-lan'
+          	list interface 'lan1'
+          	list interface 'lan2'
+          	list interface 'lan3'
+          	list interface 'lan4'
+          	list interface 'wan'
+          LLDP_EOF
+          if [ -x "/etc/init.d/lldpd" ]; then
+              /etc/init.d/lldpd enable 2>/dev/null || true
+              /etc/init.d/lldpd restart 2>/dev/null || true
+          fi
+
+          # ------------------------------------------------------------------------------
+          # 6. Enable Wi-Fi by Default, Set Country PA (Max 30 dBm + HT40/VHT80)
+          #    & Disable "Disassociate On Low Acknowledgement" (disassoc_low_ack=0)
+          # ------------------------------------------------------------------------------
+          /sbin/wifi config 2>/dev/null || true
+
+          if is_valid_mac "$ORIG_MAC_2G"; then
+              uci set wireless.radio0.macaddr="$ORIG_MAC_2G"
+              uci set wireless.radio1.macaddr="$ORIG_MAC_5G"
+          fi
 
           uci set wireless.radio0.disabled='0'
-          uci set wireless.radio0.country='00'
-          uci set wireless.radio0.channel='auto'
+          uci set wireless.radio0.country='PA'
+          uci set wireless.radio0.channel='1'
           uci set wireless.radio0.htmode='HT40'
           uci set wireless.radio0.noscan='1'
           uci set wireless.radio0.txpower='30'
+
           uci set wireless.default_radio0.disabled='0'
           uci set wireless.default_radio0.network='lan'
           uci set wireless.default_radio0.mode='ap'
           uci set wireless.default_radio0.ssid="ZTE_${DEFAULT_SSID_SUFFIX}"
           uci set wireless.default_radio0.encryption='none'
+          uci set wireless.default_radio0.disassoc_low_ack='0'
 
           uci set wireless.radio1.disabled='0'
-          uci set wireless.radio1.country='00'
-          uci set wireless.radio1.channel='auto'
+          uci set wireless.radio1.country='PA'
+          uci set wireless.radio1.channel='149'
           uci set wireless.radio1.htmode='VHT80'
+          uci set wireless.radio1.noscan='1'
           uci set wireless.radio1.txpower='30'
+
           uci set wireless.default_radio1.disabled='0'
           uci set wireless.default_radio1.network='lan'
           uci set wireless.default_radio1.mode='ap'
           uci set wireless.default_radio1.ssid="ZTE_${DEFAULT_SSID_SUFFIX}_5G"
           uci set wireless.default_radio1.encryption='none'
+          uci set wireless.default_radio1.disassoc_low_ack='0'
+
           uci commit wireless
+          /sbin/wifi reload 2>/dev/null || true
           exit 0
           EOF
           chmod +x ./files/etc/uci-defaults/99-yemen-ap-custom
@@ -376,6 +472,8 @@ jobs:
                   uci set wireless.default_radio1.encryption='none'
                   uci delete wireless.default_radio1.key 2>/dev/null || true
               fi
+              uci set wireless.default_radio0.disassoc_low_ack='0'
+              uci set wireless.default_radio1.disassoc_low_ack='0'
               uci commit network
               uci commit wireless
               (sleep 1; /etc/init.d/network reload; wifi reload) >/dev/null 2>&1 &
@@ -397,11 +495,11 @@ jobs:
           <style>
             body { font-family: sans-serif; background: #f3f4f6; margin: 0; padding: 20px; color: #1f2937; }
             .card { max-width: 480px; margin: 20px auto; background: #fff; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); padding: 24px; }
-            h2 { margin-top: 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; }
-            .meta { background: #f9fafb; padding: 10px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; border: 1px solid #e5e7eb; }
+            h2 { margin-top: 0; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; color: #0284c7; }
+            .meta { background: #f0f9ff; padding: 10px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; border: 1px solid #bae6fd; }
             label { display: block; font-weight: 600; margin: 12px 0 4px; font-size: 14px; }
             input, select { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; box-sizing: border-box; }
-            button { width: 100%; margin-top: 20px; padding: 12px; background: #2563eb; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
+            button { width: 100%; margin-top: 20px; padding: 12px; background: #0284c7; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
             .links { margin-top: 16px; text-align: center; font-size: 13px; }
           </style>
           </head>
@@ -409,13 +507,13 @@ jobs:
           <div class="card">
             <h2>ZTE E8820V2 Quick Setup</h2>
             $MSG
-            <div class="meta"><b>Original Sticker MAC:</b> ${CUR_MAC} | <b>Mode:</b> Bridge AP (DHCP Off)</div>
+            <div class="meta"><b>Original MAC:</b> ${CUR_MAC} | <b>LLDP/CDP:</b> Active | <b>Country:</b> PA (30 dBm)</div>
             <form method="POST" action="/cgi-bin/quick">
               <label>Router LAN IP Address</label>
               <input type="text" name="ipaddr" value="${CUR_IP}" required>
-              <label>2.4GHz Wi-Fi Name (SSID)</label>
+              <label>2.4GHz Wi-Fi Name (SSID - HT40)</label>
               <input type="text" name="ssid2" value="${CUR_SSID2}" required>
-              <label>5GHz Wi-Fi Name (SSID)</label>
+              <label>5GHz Wi-Fi Name (SSID - VHT80)</label>
               <input type="text" name="ssid5" value="${CUR_SSID5}" required>
               <label>Wi-Fi Password (leave empty for Open Hotspot)</label>
               <input type="text" name="wpakey" value="${CUR_KEY}" placeholder="Open Network (No Password)">
@@ -438,7 +536,6 @@ jobs:
       - name: 4. Fast Feeds Update & Configuration
         working-directory: ./openwrt
         run: |
-          # Remove unused feeds (telephony & routing) to speed up feed update by 50%
           sed -i '/telephony/d; /routing/d' feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
@@ -450,6 +547,13 @@ jobs:
           CONFIG_PACKAGE_luci-base=y
           CONFIG_PACKAGE_luci-compat=y
           CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_lldpd=y
+          CONFIG_PACKAGE_luci-app-lldpd=y
+          CONFIG_PACKAGE_watchcat=y
+          CONFIG_PACKAGE_luci-app-watchcat=y
+          CONFIG_PACKAGE_odhcpd-ipv6only=y
+          CONFIG_PACKAGE_dnsmasq=y
+          CONFIG_PACKAGE_firewall=y
           CONFIG_PACKAGE_kmod-mt7603=y
           CONFIG_PACKAGE_kmod-mt76x2=y
           CONFIG_PACKAGE_kmod-usb3=y
@@ -457,8 +561,6 @@ jobs:
           CONFIG_PACKAGE_wpad-basic-wolfssl=y
           CONFIG_PACKAGE_iw=y
           CONFIG_PACKAGE_iwinfo=y
-          # CONFIG_PACKAGE_odhcpd-ipv6only is not set
-          # CONFIG_PACKAGE_odhcpd is not set
           EOF
           make defconfig
 
@@ -472,5 +574,5 @@ jobs:
       - name: 6. Upload Ready-to-Flash Firmware (.bin)
         uses: actions/upload-artifact@v4
         with:
-          name: ZTE-E8820V2-Yemen-AP-Firmware
+          name: ZTE-E8820V2-Yemen-AP-Firmware-v3
           path: openwrt/bin/targets/ramips/mt7621/*sysupgrade.bin
